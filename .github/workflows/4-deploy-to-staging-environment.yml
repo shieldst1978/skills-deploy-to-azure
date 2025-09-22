@@ -1,77 +1,101 @@
-name: Step 4, Deploy to staging
+name: Deploy to staging
 
-# This workflow updates from step 4 to step 5.
-
-# This will run after the "Deploy to staging" workflow
-# completes on the staging-test branch
-# Reference: https://docs.github.com/en/actions/learn-github-actions/events-that-trigger-workflows
 on:
-  workflow_dispatch:
-  workflow_run:
-    workflows: ["Deploy to staging"]
-    types: [completed]
-    branches: [staging-test]
+  pull_request:
+    types: [labeled]
 
-permissions:
-  # Need `contents: read` to checkout the repository.
-  # Need `contents: write` to update the step metadata.
-  contents: write
-  pull-requests: write
+env:
+  IMAGE_REGISTRY_URL: ghcr.io
+  ###############################################
+  ### Replace <username> with GitHub username ###
+  ###############################################
+  DOCKER_IMAGE_NAME: <username>-azure-ttt
+  AZURE_WEBAPP_NAME: <username>-ttt-app
+  ###############################################
 
 jobs:
-  # Get the current step to only run the main job when the learner is on the same step.
-  get_current_step:
-    name: Check current step number
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-      - id: get_step
-        run: |
-          echo "current_step=$(cat ./.github/steps/-step.txt)" >> $GITHUB_OUTPUT
-    outputs:
-      current_step: ${{ steps.get_step.outputs.current_step }}
+  build:
+    if: contains(github.event.pull_request.labels.*.name, 'stage')
 
-  on_azure_environment_created:
-    name: On Azure environment created
-    needs: get_current_step
     runs-on: ubuntu-latest
 
-    # We will only run this action when:
-    # 1. This repository isn't the template repository.
-    # 2. The step is currently 4.
-    # Reference: https://docs.github.com/en/actions/learn-github-actions/contexts
-    # Reference: https://docs.github.com/en/actions/learn-github-actions/expressions
-    if: >-
-      ${{ !github.event.repository.is_template
-          && needs.get_current_step.outputs.current_step == 4 }}
-
     steps:
-      # We'll need to check out the repository so that we can edit the README.
-      - name: Checkout
-        uses: actions/checkout@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          fetch-depth: 0 # Let's get all the branches.
-
-      # Merge the pull open pull request
-      - name: Merge Pull Request
-        run: gh pr merge --squash staging-test
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      # Pull main.
-      - name: Pull main
+          node-version: 16
+      - name: npm install and build webpack
         run: |
-          chmod +x ./.github/script/initialize-repository.sh
-          ./.github/script/initialize-repository.sh
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      # In README.md, switch step 4 for step 5.
-      - name: Update to step 5
-        uses: skills/action-update-step@v2
+          npm install
+          npm run build
+      - uses: actions/upload-artifact@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          from_step: 4
-          to_step: 5
-          branch_name: staging-test
+          name: webpack artifacts
+          path: public/
+
+  Build-Docker-Image:
+    runs-on: ubuntu-latest
+    needs: build
+    name: Build image and store in GitHub Container Registry
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download built artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: webpack artifacts
+          path: public
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.IMAGE_REGISTRY_URL }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.CR_PAT }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{env.IMAGE_REGISTRY_URL}}/${{ github.repository }}/${{env.DOCKER_IMAGE_NAME}}
+          tags: |
+            type=sha,format=long,prefix=
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  Deploy-to-Azure:
+    runs-on: ubuntu-latest
+    needs: Build-Docker-Image
+    name: Deploy app container to Azure
+    steps:
+      - name: "Login via Azure CLI"
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - uses: azure/docker-login@v1
+        with:
+          login-server: ${{env.IMAGE_REGISTRY_URL}}
+          username: ${{ github.actor }}
+          password: ${{ secrets.CR_PAT }}
+
+      - name: Deploy web app container
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{env.AZURE_WEBAPP_NAME}}
+          images: ${{env.IMAGE_REGISTRY_URL}}/${{ github.repository }}/${{env.DOCKER_IMAGE_NAME}}:${{ github.sha }}
+
+      - name: Azure logout via Azure CLI
+        uses: azure/CLI@v2
+        with:
+          inlineScript: |
+            az logout
+            az cache purge
+            az account clear
